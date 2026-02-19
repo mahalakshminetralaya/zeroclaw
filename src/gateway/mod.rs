@@ -7,7 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, SendMessage, WhatsAppChannel};
+use crate::channels::{Channel, LinqChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, Provider};
@@ -51,6 +51,10 @@ fn webhook_memory_key() -> String {
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("linq_{}_{}", msg.sender, msg.id)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -274,6 +278,9 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    pub linq: Option<Arc<LinqChannel>>,
+    /// Linq webhook signing secret for signature verification
+    pub linq_signing_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
 }
@@ -389,6 +396,34 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    // Linq channel (if configured)
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
+        Arc::new(LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
+        ))
+    });
+
+    // Linq signing secret for webhook signature verification
+    // Priority: environment variable > config file
+    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
+        .ok()
+        .and_then(|secret| {
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| secret.to_owned())
+        })
+        .or_else(|| {
+            config.channels_config.linq.as_ref().and_then(|lq| {
+                lq.signing_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .map(Arc::from);
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -440,6 +475,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    if linq_channel.is_some() {
+        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
+    }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -476,6 +514,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        linq: linq_channel,
+        linq_signing_secret,
         observer,
     };
 
@@ -487,6 +527,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/linq", post(handle_linq_webhook))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -547,10 +588,10 @@ async fn handle_pair(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_pair(&client_key) {
-        tracing::warn!("/pair rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        tracing::warn!("/pair rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many pairing requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -624,10 +665,10 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&client_key) {
-        tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/webhook rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -967,6 +1008,118 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
+async fn handle_linq_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref linq) = state.linq else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Linq not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
+    if let Some(ref signing_secret) = state.linq_signing_secret {
+        let timestamp = headers
+            .get("X-Webhook-Timestamp")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Webhook-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::linq::verify_linq_signature(
+            signing_secret,
+            &body_str,
+            timestamp,
+            signature,
+        ) {
+            tracing::warn!(
+                "Linq webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = linq.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        // Acknowledge the webhook even if no messages (could be status/delivery events)
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "Linq message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        // Auto-save to memory
+        if state.auto_save {
+            let key = linq_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // Call the LLM
+        match state
+            .provider
+            .simple_chat(&msg.content, &state.model, state.temperature)
+            .await
+        {
+            Ok(response) => {
+                // Send reply via Linq
+                if let Err(e) = linq
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Linq reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Linq message: {e:#}");
+                let _ = linq
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,6 +1132,13 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
+    fn generate_test_secret() -> String {
+        use rand::Rng;
+        let bytes: [u8; 32] = rand::rng().random();
+        hex::encode(bytes)
+    }
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -1221,8 +1381,8 @@ mod tests {
         assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
-    #[test]
-    fn persist_pairing_tokens_writes_config_tokens() {
+    #[tokio::test]
+    async fn persist_pairing_tokens_writes_config_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let workspace_path = temp.path().join("workspace");
@@ -1240,7 +1400,7 @@ mod tests {
         let shared_config = Arc::new(Mutex::new(config));
         persist_pairing_tokens(&shared_config, &guard).unwrap();
 
-        let saved = std::fs::read_to_string(config_path).unwrap();
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
         assert_eq!(parsed.gateway.paired_tokens.len(), 1);
         let persisted = &parsed.gateway.paired_tokens[0];
@@ -1426,6 +1586,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1482,6 +1644,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1518,9 +1682,11 @@ mod tests {
 
     #[test]
     fn webhook_secret_hash_is_deterministic_and_nonempty() {
-        let one = hash_webhook_secret("secret-value");
-        let two = hash_webhook_secret("secret-value");
-        let other = hash_webhook_secret("other-value");
+        let secret_a = generate_test_secret();
+        let secret_b = generate_test_secret();
+        let one = hash_webhook_secret(&secret_a);
+        let two = hash_webhook_secret(&secret_a);
+        let other = hash_webhook_secret(&secret_b);
 
         assert_eq!(one, two);
         assert_ne!(one, other);
@@ -1532,6 +1698,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1540,13 +1707,15 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1570,6 +1739,8 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let valid_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1578,18 +1749,23 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("wrong-secret"));
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&wrong_secret).unwrap(),
+        );
 
         let response = handle_webhook(
             State(state),
@@ -1611,6 +1787,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1619,18 +1796,23 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("super-secret"));
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&secret).unwrap(),
+        );
 
         let response = handle_webhook(
             State(state),
@@ -1666,14 +1848,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_valid() {
-        // Test with known values
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1681,14 +1862,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = "correct_secret_key_abc";
-        let wrong_secret = "wrong_secret_key_xyz";
+        let app_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(wrong_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1696,15 +1877,15 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let original_body = b"original body";
         let tampered_body = b"tampered body";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, original_body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
 
         // Verify with tampered body should fail
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             tampered_body,
             &signature_header
         ));
@@ -1712,14 +1893,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_missing_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Signature without "sha256=" prefix
         let signature_header = "abc123def456";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -1727,22 +1908,22 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_header() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        assert!(!verify_whatsapp_signature(app_secret, body, ""));
+        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
     }
 
     #[test]
     fn whatsapp_signature_invalid_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Invalid hex characters
         let signature_header = "sha256=not_valid_hex_zzz";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -1750,13 +1931,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1764,13 +1945,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_unicode_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = "Hello 🦀 World".as_bytes();
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1778,13 +1959,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_json_payload() {
-        let app_secret = "test_app_secret_key_xyz";
+        let app_secret = generate_test_secret();
         let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1792,31 +1973,31 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
 
         // Wrong case prefix should fail
         let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(app_secret, body, &wrong_prefix));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(&app_secret, body, &correct_prefix));
     }
 
     #[test]
     fn whatsapp_signature_truncated_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let truncated = &hex_sig[..32]; // Only half the signature
         let signature_header = format!("sha256={truncated}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1824,15 +2005,15 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_extra_bytes() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let extended = format!("{hex_sig}deadbeef");
         let signature_header = format!("sha256={extended}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));

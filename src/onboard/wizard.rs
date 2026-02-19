@@ -1,7 +1,9 @@
-use crate::config::schema::{DingTalkConfig, IrcConfig, QQConfig, StreamMode, WhatsAppConfig};
+use crate::config::schema::{
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
+};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
+    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
     RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
@@ -55,6 +57,41 @@ const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
+
+fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
+    let ChannelsConfig {
+        cli: _,     // `cli` is always available and does not require channel server startup
+        webhook: _, // webhook traffic is handled by gateway, not `zeroclaw channel start`
+        telegram,
+        discord,
+        slack,
+        mattermost,
+        imessage,
+        matrix,
+        signal,
+        whatsapp,
+        email,
+        irc,
+        lark,
+        dingtalk,
+        qq,
+        ..
+    } = channels;
+
+    telegram.is_some()
+        || discord.is_some()
+        || slack.is_some()
+        || mattermost.is_some()
+        || imessage.is_some()
+        || matrix.is_some()
+        || signal.is_some()
+        || whatsapp.is_some()
+        || email.is_some()
+        || irc.is_some()
+        || lark.is_some()
+        || dingtalk.is_some()
+        || qq.is_some()
+}
 
 // ── Main wizard entry point ──────────────────────────────────────
 
@@ -161,14 +198,7 @@ pub fn run_wizard() -> Result<Config> {
     print_summary(&config);
 
     // ── Offer to launch channels immediately ─────────────────────
-    let has_channels = config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+    let has_channels = has_launchable_channels(&config.channels_config);
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -220,14 +250,7 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         style(config.config_path.display()).green()
     );
 
-    let has_channels = config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+    let has_channels = has_launchable_channels(&config.channels_config);
 
     if has_channels && config.api_key.is_some() {
         let launch: bool = Confirm::new()
@@ -333,7 +356,11 @@ pub fn run_quick_setup(
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: credential_override.map(String::from),
+        api_key: credential_override.map(|c| {
+            let mut s = String::with_capacity(c.len());
+            s.push_str(c);
+            s
+        }),
         api_url: None,
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
@@ -2444,23 +2471,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
 
-    let mut config = ChannelsConfig {
-        cli: true,
-        telegram: None,
-        discord: None,
-        slack: None,
-        mattermost: None,
-        webhook: None,
-        imessage: None,
-        matrix: None,
-        signal: None,
-        whatsapp: None,
-        email: None,
-        irc: None,
-        lark: None,
-        dingtalk: None,
-        qq: None,
-    };
+    let mut config = ChannelsConfig::default();
 
     loop {
         let options = vec![
@@ -2513,6 +2524,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 }
             ),
             format!(
+                "Linq       {}",
+                if config.linq.is_some() {
+                    "✅ connected"
+                } else {
+                    "— iMessage/RCS/SMS via Linq API"
+                }
+            ),
+            format!(
                 "IRC        {}",
                 if config.irc.is_some() {
                     "✅ configured"
@@ -2544,13 +2563,21 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     "— Tencent QQ Bot"
                 }
             ),
+            format!(
+                "Lark/Feishu {}",
+                if config.lark.is_some() {
+                    "✅ connected"
+                } else {
+                    "— Lark/Feishu Bot"
+                }
+            ),
             "Done — finish setup".to_string(),
         ];
 
         let choice = Select::new()
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
-            .default(10)
+            .default(11)
             .interact()?;
 
         match choice {
@@ -3126,6 +3153,98 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 });
             }
             6 => {
+                // ── Linq ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Linq Setup").white().bold(),
+                    style("— iMessage/RCS/SMS via Linq API").dim()
+                );
+                print_bullet("1. Sign up at linqapp.com and get your Partner API token");
+                print_bullet("2. Note your Linq phone number (E.164 format)");
+                print_bullet("3. Configure webhook URL to: https://your-domain/linq");
+                println!();
+
+                let api_token: String = Input::new()
+                    .with_prompt("  API token (Linq Partner API token)")
+                    .interact_text()?;
+
+                if api_token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let from_phone: String = Input::new()
+                    .with_prompt("  From phone number (E.164 format, e.g. +12223334444)")
+                    .interact_text()?;
+
+                if from_phone.trim().is_empty() {
+                    println!("  {} Skipped — phone number required", style("→").dim());
+                    continue;
+                }
+
+                // Test connection
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let api_token_clone = api_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let url = "https://api.linqapp.com/api/partner/v3/phonenumbers";
+                    let resp = client
+                        .get(url)
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", api_token_clone.trim()),
+                        )
+                        .send()?;
+                    Ok::<_, reqwest::Error>(resp.status().is_success())
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
+                        println!(
+                            "\r  {} Connected to Linq API              ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check API token",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let users_str: String = Input::new()
+                    .with_prompt(
+                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
+                    )
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_senders = if users_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    users_str.split(',').map(|s| s.trim().to_string()).collect()
+                };
+
+                let signing_secret: String = Input::new()
+                    .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                config.linq = Some(LinqConfig {
+                    api_token: api_token.trim().to_string(),
+                    from_phone: from_phone.trim().to_string(),
+                    signing_secret: if signing_secret.trim().is_empty() {
+                        None
+                    } else {
+                        Some(signing_secret.trim().to_string())
+                    },
+                    allowed_senders,
+                });
+            }
+            7 => {
                 // ── IRC ──
                 println!();
                 println!(
@@ -3264,7 +3383,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     verify_tls: Some(verify_tls),
                 });
             }
-            7 => {
+            8 => {
                 // ── Webhook ──
                 println!();
                 println!(
@@ -3297,7 +3416,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&port).cyan()
                 );
             }
-            8 => {
+            9 => {
                 // ── DingTalk ──
                 println!();
                 println!(
@@ -3367,7 +3486,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
-            9 => {
+            10 => {
                 // ── QQ Official ──
                 println!();
                 println!(
@@ -3443,6 +3562,193 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                 });
             }
+            10 => {
+                // ── Lark/Feishu ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Lark/Feishu Setup").white().bold(),
+                    style("— talk to ZeroClaw from Lark or Feishu").dim()
+                );
+                print_bullet(
+                    "1. Go to Lark/Feishu Open Platform (open.larksuite.com / open.feishu.cn)",
+                );
+                print_bullet("2. Create an app and enable 'Bot' capability");
+                print_bullet("3. Copy the App ID and App Secret");
+                println!();
+
+                let app_id: String = Input::new().with_prompt("  App ID").interact_text()?;
+                let app_id = app_id.trim().to_string();
+
+                if app_id.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let app_secret: String =
+                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret = app_secret.trim().to_string();
+
+                if app_secret.is_empty() {
+                    println!("  {} App Secret is required", style("❌").red().bold());
+                    continue;
+                }
+
+                let use_feishu = Select::new()
+                    .with_prompt("  Region")
+                    .items(["Feishu (CN)", "Lark (International)"])
+                    .default(0)
+                    .interact()?
+                    == 0;
+
+                // Test connection (run entirely in separate thread — Response must be used/dropped there)
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let base_url = if use_feishu {
+                    "https://open.feishu.cn/open-apis"
+                } else {
+                    "https://open.larksuite.com/open-apis"
+                };
+                let app_id_clone = app_id.clone();
+                let app_secret_clone = app_secret.clone();
+                let endpoint = format!("{base_url}/auth/v3/tenant_access_token/internal");
+
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(8))
+                        .connect_timeout(Duration::from_secs(4))
+                        .build()
+                        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
+                    let body = serde_json::json!({
+                        "app_id": app_id_clone,
+                        "app_secret": app_secret_clone,
+                    });
+
+                    let response = client
+                        .post(endpoint)
+                        .json(&body)
+                        .send()
+                        .map_err(|err| format!("request error: {err}"))?;
+
+                    let status = response.status();
+                    let payload: Value = response.json().unwrap_or_default();
+                    let has_token = payload
+                        .get("tenant_access_token")
+                        .and_then(Value::as_str)
+                        .is_some_and(|token| !token.trim().is_empty());
+
+                    if status.is_success() && has_token {
+                        return Ok::<(), String>(());
+                    }
+
+                    let detail = payload
+                        .get("msg")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
+
+                    Err(format!("auth rejected ({status}): {detail}"))
+                })
+                .join();
+
+                match thread_result {
+                    Ok(Ok(())) => {
+                        println!(
+                            "\r  {} Lark/Feishu credentials verified        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    Ok(Err(reason)) => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        println!("    {}", style(reason).dim());
+                        continue;
+                    }
+                    Err(_) => {
+                        println!(
+                            "\r  {} Connection failed — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let receive_mode_choice = Select::new()
+                    .with_prompt("  Receive Mode")
+                    .items([
+                        "WebSocket (recommended, no public IP needed)",
+                        "Webhook (requires public HTTPS endpoint)",
+                    ])
+                    .default(0)
+                    .interact()?;
+
+                let receive_mode = if receive_mode_choice == 0 {
+                    LarkReceiveMode::Websocket
+                } else {
+                    LarkReceiveMode::Webhook
+                };
+
+                let verification_token = if receive_mode == LarkReceiveMode::Webhook {
+                    let token: String = Input::new()
+                        .with_prompt("  Verification Token (optional, for Webhook mode)")
+                        .allow_empty(true)
+                        .interact_text()?;
+                    if token.is_empty() {
+                        None
+                    } else {
+                        Some(token)
+                    }
+                } else {
+                    None
+                };
+
+                if receive_mode == LarkReceiveMode::Webhook && verification_token.is_none() {
+                    println!(
+                        "  {} Verification Token is empty — webhook authenticity checks are reduced.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                let port = if receive_mode == LarkReceiveMode::Webhook {
+                    let p: String = Input::new()
+                        .with_prompt("  Webhook Port")
+                        .default("8080".into())
+                        .interact_text()?;
+                    Some(p.parse().unwrap_or(8080))
+                } else {
+                    None
+                };
+
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed user Open IDs (comma-separated, '*' for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users: Vec<String> = users_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if allowed_users.is_empty() {
+                    println!(
+                        "  {} No users allowlisted — Lark/Feishu inbound messages will be denied until you add Open IDs or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                config.lark = Some(LarkConfig {
+                    app_id,
+                    app_secret,
+                    verification_token,
+                    encrypt_key: None,
+                    allowed_users,
+                    use_feishu,
+                    receive_mode,
+                    port,
+                });
+            }
             _ => break, // Done
         }
         println!();
@@ -3468,6 +3774,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     if config.whatsapp.is_some() {
         active.push("WhatsApp");
     }
+    if config.linq.is_some() {
+        active.push("Linq");
+    }
     if config.email.is_some() {
         active.push("Email");
     }
@@ -3482,6 +3791,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.qq.is_some() {
         active.push("QQ");
+    }
+    if config.lark.is_some() {
+        active.push("Lark");
     }
 
     println!(
@@ -3524,10 +3836,10 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         1 => {
             println!();
             print_bullet("Get your tunnel token from the Cloudflare Zero Trust dashboard.");
-            let token: String = Input::new()
+            let tunnel_value: String = Input::new()
                 .with_prompt("  Cloudflare tunnel token")
                 .interact_text()?;
-            if token.trim().is_empty() {
+            if tunnel_value.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
             } else {
@@ -3538,7 +3850,9 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
                 );
                 TunnelConfig {
                     provider: "cloudflare".into(),
-                    cloudflare: Some(CloudflareTunnelConfig { token }),
+                    cloudflare: Some(CloudflareTunnelConfig {
+                        token: tunnel_value,
+                    }),
                     ..TunnelConfig::default()
                 }
             }
@@ -3928,14 +4242,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
 
 #[allow(clippy::too_many_lines)]
 fn print_summary(config: &Config) {
-    let has_channels = config.channels_config.telegram.is_some()
-        || config.channels_config.discord.is_some()
-        || config.channels_config.slack.is_some()
-        || config.channels_config.imessage.is_some()
-        || config.channels_config.matrix.is_some()
-        || config.channels_config.email.is_some()
-        || config.channels_config.dingtalk.is_some()
-        || config.channels_config.qq.is_some();
+    let has_channels = has_launchable_channels(&config.channels_config);
 
     println!();
     println!(
@@ -4002,6 +4309,9 @@ fn print_summary(config: &Config) {
     }
     if config.channels_config.webhook.is_some() {
         channels.push("Webhook");
+    }
+    if config.channels_config.lark.is_some() {
+        channels.push("Lark");
     }
     println!(
         "    {} Channels:      {}",
@@ -4238,8 +4548,8 @@ mod tests {
 
     // ── scaffold_workspace: personalization ─────────────────────
 
-    #[test]
-    fn scaffold_bakes_user_name_into_files() {
+    #[tokio::test]
+    async fn scaffold_bakes_user_name_into_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Alice".into(),
@@ -4247,21 +4557,25 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("**Name:** Alice"),
             "USER.md should contain user name"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("**Alice**"),
             "BOOTSTRAP.md should contain user name"
         );
     }
 
-    #[test]
-    fn scaffold_bakes_timezone_into_files() {
+    #[tokio::test]
+    async fn scaffold_bakes_timezone_into_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             timezone: "US/Pacific".into(),
@@ -4269,21 +4583,25 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("**Timezone:** US/Pacific"),
             "USER.md should contain timezone"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("US/Pacific"),
             "BOOTSTRAP.md should contain timezone"
         );
     }
 
-    #[test]
-    fn scaffold_bakes_agent_name_into_files() {
+    #[tokio::test]
+    async fn scaffold_bakes_agent_name_into_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             agent_name: "Crabby".into(),
@@ -4291,39 +4609,49 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
+            .await
+            .unwrap();
         assert!(
             identity.contains("**Name:** Crabby"),
             "IDENTITY.md should contain agent name"
         );
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("You are **Crabby**"),
             "SOUL.md should contain agent name"
         );
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
         assert!(
             agents.contains("Crabby Personal Assistant"),
             "AGENTS.md should contain agent name"
         );
 
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
+        let heartbeat = tokio::fs::read_to_string(tmp.path().join("HEARTBEAT.md"))
+            .await
+            .unwrap();
         assert!(
             heartbeat.contains("Crabby"),
             "HEARTBEAT.md should contain agent name"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("Introduce yourself as Crabby"),
             "BOOTSTRAP.md should contain agent name"
         );
     }
 
-    #[test]
-    fn scaffold_bakes_communication_style() {
+    #[tokio::test]
+    async fn scaffold_bakes_communication_style() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             communication_style: "Be technical and detailed.".into(),
@@ -4331,19 +4659,25 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("Be technical and detailed."),
             "SOUL.md should contain communication style"
         );
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("Be technical and detailed."),
             "USER.md should contain communication style"
         );
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(
             bootstrap.contains("Be technical and detailed."),
             "BOOTSTRAP.md should contain communication style"
@@ -4352,19 +4686,23 @@ mod tests {
 
     // ── scaffold_workspace: defaults when context is empty ──────
 
-    #[test]
-    fn scaffold_uses_defaults_for_empty_context() {
+    #[tokio::test]
+    async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
+            .await
+            .unwrap();
         assert!(
             identity.contains("**Name:** ZeroClaw"),
             "should default agent name to ZeroClaw"
         );
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(
             user_md.contains("**Name:** User"),
             "should default user name to User"
@@ -4374,7 +4712,9 @@ mod tests {
             "should default timezone to UTC"
         );
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("Be warm, natural, and clear."),
             "should default communication style"
@@ -4383,8 +4723,8 @@ mod tests {
 
     // ── scaffold_workspace: skip existing files ─────────────────
 
-    #[test]
-    fn scaffold_does_not_overwrite_existing_files() {
+    #[tokio::test]
+    async fn scaffold_does_not_overwrite_existing_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Bob".into(),
@@ -4398,7 +4738,7 @@ mod tests {
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
         // SOUL.md should be untouched
-        let soul = fs::read_to_string(&soul_path).unwrap();
+        let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
         assert!(
             soul.contains("Do not overwrite me"),
             "existing files should not be overwritten"
@@ -4409,14 +4749,16 @@ mod tests {
         );
 
         // But USER.md should be created fresh
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(user_md.contains("**Name:** Bob"));
     }
 
     // ── scaffold_workspace: idempotent ──────────────────────────
 
-    #[test]
-    fn scaffold_is_idempotent() {
+    #[tokio::test]
+    async fn scaffold_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Eve".into(),
@@ -4425,19 +4767,23 @@ mod tests {
         };
 
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v1 = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
 
         // Run again — should not change anything
         scaffold_workspace(tmp.path(), &ctx).unwrap();
-        let soul_v2 = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
 
         assert_eq!(soul_v1, soul_v2, "scaffold should be idempotent");
     }
 
     // ── scaffold_workspace: all files are non-empty ─────────────
 
-    #[test]
-    fn scaffold_files_are_non_empty() {
+    #[tokio::test]
+    async fn scaffold_files_are_non_empty() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
@@ -4452,20 +4798,22 @@ mod tests {
             "BOOTSTRAP.md",
             "MEMORY.md",
         ] {
-            let content = fs::read_to_string(tmp.path().join(f)).unwrap();
+            let content = tokio::fs::read_to_string(tmp.path().join(f)).await.unwrap();
             assert!(!content.trim().is_empty(), "{f} should not be empty");
         }
     }
 
     // ── scaffold_workspace: AGENTS.md references on-demand memory
 
-    #[test]
-    fn agents_md_references_on_demand_memory() {
+    #[tokio::test]
+    async fn agents_md_references_on_demand_memory() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
         assert!(
             agents.contains("memory_recall"),
             "AGENTS.md should reference memory_recall for on-demand access"
@@ -4478,13 +4826,15 @@ mod tests {
 
     // ── scaffold_workspace: MEMORY.md warns about token cost ────
 
-    #[test]
-    fn memory_md_warns_about_token_cost() {
+    #[tokio::test]
+    async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let memory = fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
+            .await
+            .unwrap();
         assert!(
             memory.contains("costs tokens"),
             "MEMORY.md should warn about token cost"
@@ -4497,13 +4847,15 @@ mod tests {
 
     // ── scaffold_workspace: TOOLS.md lists memory_forget ────────
 
-    #[test]
-    fn tools_md_lists_all_builtin_tools() {
+    #[tokio::test]
+    async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let tools = fs::read_to_string(tmp.path().join("TOOLS.md")).unwrap();
+        let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
+            .await
+            .unwrap();
         for tool in &[
             "shell",
             "file_read",
@@ -4527,13 +4879,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn soul_md_includes_emoji_awareness_guidance() {
+    #[tokio::test]
+    async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(
             soul.contains("Use emojis naturally (0-2 max"),
             "SOUL.md should include emoji usage guidance"
@@ -4546,8 +4900,8 @@ mod tests {
 
     // ── scaffold_workspace: special characters in names ─────────
 
-    #[test]
-    fn scaffold_handles_special_characters_in_names() {
+    #[tokio::test]
+    async fn scaffold_handles_special_characters_in_names() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "José María".into(),
@@ -4557,17 +4911,21 @@ mod tests {
         };
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(user_md.contains("José María"));
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(soul.contains("ZeroClaw-v2"));
     }
 
     // ── scaffold_workspace: full personalization round-trip ─────
 
-    #[test]
-    fn scaffold_full_personalization() {
+    #[tokio::test]
+    async fn scaffold_full_personalization() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
             user_name: "Argenis".into(),
@@ -4580,27 +4938,39 @@ mod tests {
         scaffold_workspace(tmp.path(), &ctx).unwrap();
 
         // Verify every file got personalized
-        let identity = fs::read_to_string(tmp.path().join("IDENTITY.md")).unwrap();
+        let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
+            .await
+            .unwrap();
         assert!(identity.contains("**Name:** Claw"));
 
-        let soul = fs::read_to_string(tmp.path().join("SOUL.md")).unwrap();
+        let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
+            .await
+            .unwrap();
         assert!(soul.contains("You are **Claw**"));
         assert!(soul.contains("Be friendly, human, and conversational"));
 
-        let user_md = fs::read_to_string(tmp.path().join("USER.md")).unwrap();
+        let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(user_md.contains("**Name:** Argenis"));
         assert!(user_md.contains("**Timezone:** US/Eastern"));
         assert!(user_md.contains("Be friendly, human, and conversational"));
 
-        let agents = fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
         assert!(agents.contains("Claw Personal Assistant"));
 
-        let bootstrap = fs::read_to_string(tmp.path().join("BOOTSTRAP.md")).unwrap();
+        let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
+            .await
+            .unwrap();
         assert!(bootstrap.contains("**Argenis**"));
         assert!(bootstrap.contains("US/Eastern"));
         assert!(bootstrap.contains("Introduce yourself as Claw"));
 
-        let heartbeat = fs::read_to_string(tmp.path().join("HEARTBEAT.md")).unwrap();
+        let heartbeat = tokio::fs::read_to_string(tmp.path().join("HEARTBEAT.md"))
+            .await
+            .unwrap();
         assert!(heartbeat.contains("Claw"));
     }
 
@@ -5082,5 +5452,29 @@ mod tests {
         assert_eq!(config.archive_after_days, 0);
         assert_eq!(config.purge_after_days, 0);
         assert_eq!(config.embedding_cache_size, 0);
+    }
+
+    #[test]
+    fn launchable_channels_include_mattermost_and_qq() {
+        let mut channels = ChannelsConfig::default();
+        assert!(!has_launchable_channels(&channels));
+
+        channels.mattermost = Some(crate::config::schema::MattermostConfig {
+            url: "https://mattermost.example.com".into(),
+            bot_token: "token".into(),
+            channel_id: Some("channel".into()),
+            allowed_users: vec!["*".into()],
+            thread_replies: Some(true),
+            mention_only: Some(false),
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.mattermost = None;
+        channels.qq = Some(crate::config::schema::QQConfig {
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
     }
 }

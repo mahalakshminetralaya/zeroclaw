@@ -5,6 +5,7 @@ pub mod email_channel;
 pub mod imessage;
 pub mod irc;
 pub mod lark;
+pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod qq;
@@ -21,6 +22,7 @@ pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use lark::LarkChannel;
+pub use linq::LinqChannel;
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
 pub use qq::QQChannel;
@@ -60,8 +62,9 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-/// Timeout for processing a single channel message (LLM + tools).
-/// 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
+const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
+/// Default timeout for processing a single channel message (LLM + tools).
+/// Used as fallback when not configured in channels_config.message_timeout_secs.
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
@@ -72,6 +75,10 @@ const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
+    configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChannelRouteSelection {
@@ -120,6 +127,7 @@ struct ChannelRuntimeContext {
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
+    message_timeout_secs: u64,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -696,7 +704,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     };
 
     let llm_result = tokio::time::timeout(
-        Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
+        Duration::from_secs(ctx.message_timeout_secs),
         run_tool_call_loop(
             active_provider.as_ref(),
             &mut history,
@@ -787,10 +795,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
         Err(_) => {
-            let timeout_msg = format!(
-                "LLM response timed out after {}s",
-                CHANNEL_MESSAGE_TIMEOUT_SECS
-            );
+            let timeout_msg = format!("LLM response timed out after {}s", ctx.message_timeout_secs);
             eprintln!(
                 "  ❌ {} (elapsed: {}ms)",
                 timeout_msg,
@@ -1247,11 +1252,13 @@ pub fn handle_command(command: crate::ChannelCommands, config: &Config) -> Resul
                 ("Telegram", config.channels_config.telegram.is_some()),
                 ("Discord", config.channels_config.discord.is_some()),
                 ("Slack", config.channels_config.slack.is_some()),
+                ("Mattermost", config.channels_config.mattermost.is_some()),
                 ("Webhook", config.channels_config.webhook.is_some()),
                 ("iMessage", config.channels_config.imessage.is_some()),
                 ("Matrix", config.channels_config.matrix.is_some()),
                 ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
+                ("Linq", config.channels_config.linq.is_some()),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
                 ("Lark", config.channels_config.lark.is_some()),
@@ -1384,6 +1391,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 wa.phone_number_id.clone(),
                 wa.verify_token.clone(),
                 wa.allowed_numbers.clone(),
+            )),
+        ));
+    }
+
+    if let Some(ref lq) = config.channels_config.linq {
+        channels.push((
+            "Linq",
+            Arc::new(LinqChannel::new(
+                lq.api_token.clone(),
+                lq.from_phone.clone(),
+                lq.allowed_senders.clone(),
             )),
         ));
     }
@@ -1718,6 +1736,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    if let Some(ref lq) = config.channels_config.linq {
+        channels.push(Arc::new(LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
+        )));
+    }
+
     if let Some(ref email_cfg) = config.channels_config.email {
         channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
     }
@@ -1823,6 +1849,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
+    let message_timeout_secs =
+        effective_channel_message_timeout_secs(config.channels_config.message_timeout_secs);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -1845,6 +1873,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
+        message_timeout_secs,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1888,6 +1917,19 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    #[test]
+    fn effective_channel_message_timeout_secs_clamps_to_minimum() {
+        assert_eq!(
+            effective_channel_message_timeout_secs(0),
+            MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            effective_channel_message_timeout_secs(15),
+            MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
+        );
+        assert_eq!(effective_channel_message_timeout_secs(300), 300);
     }
 
     #[derive(Default)]
@@ -2235,6 +2277,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
@@ -2287,6 +2330,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
@@ -2348,6 +2392,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
@@ -2430,6 +2475,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
@@ -2488,6 +2534,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
@@ -2541,6 +2588,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
@@ -2645,6 +2693,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2715,6 +2764,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
@@ -3105,6 +3155,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         });
 
         process_channel_message(
